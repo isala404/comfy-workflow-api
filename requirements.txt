@@ -1,0 +1,18 @@
+# ComfyUI Workflow API - Dependencies
+
+# Required
+aiohttp>=3.8.0              # Async HTTP client for webhook delivery
+
+# Optional - for enhanced validation (uncomment if desired)
+# pydantic>=2.0.0           # Data validation and serialization
+
+# Development dependencies (install with: pip install -r requirements.txt[dev])
+# pytest>=7.0.0             # Testing framework
+# pytest-asyncio>=0.21.0    # Async test support
+# pytest-cov>=4.0.0         # Coverage reporting
+
+# Note: The following are typically already available in ComfyUI:
+# - torch                   # Tensor operations
+# - numpy                   # Array operations
+# - Pillow                  # Image processing
+# - av                      # Video encoding (for video output)

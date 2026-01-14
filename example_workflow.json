@@ -1,0 +1,95 @@
+{
+  "3": {
+    "inputs": {
+      "seed": 798343486140665,
+      "steps": 20,
+      "cfg": 7,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 0.7,
+      "model": ["4", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["5", 0]
+    },
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler"}
+  },
+  "4": {
+    "inputs": {
+      "ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {"title": "Load Checkpoint"}
+  },
+  "5": {
+    "inputs": {
+      "pixels": ["13", 0],
+      "vae": ["4", 2]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {"title": "VAE Encode"}
+  },
+  "6": {
+    "inputs": {
+      "text": ["11", 0],
+      "clip": ["4", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "CLIP Text Encode (Prompt)"}
+  },
+  "7": {
+    "inputs": {
+      "text": "text, watermark, blurry, low quality",
+      "clip": ["4", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "CLIP Text Encode (Negative)"}
+  },
+  "8": {
+    "inputs": {
+      "samples": ["3", 0],
+      "vae": ["4", 2]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {"title": "VAE Decode"}
+  },
+  "10": {
+    "inputs": {
+      "default_callback_url": "",
+      "default_timeout": 60,
+      "default_max_retries": 3,
+      "debug": true
+    },
+    "class_type": "WebhookReceiver",
+    "_meta": {"title": "Webhook Receiver"}
+  },
+  "11": {
+    "inputs": {
+      "field": "prompt",
+      "debug": true,
+      "webhook_context": ["10", 0]
+    },
+    "class_type": "WebhookTransformer",
+    "_meta": {"title": "Extract Prompt"}
+  },
+  "12": {
+    "inputs": {
+      "field_1_name": "output",
+      "debug": false,
+      "webhook_context": ["10", 0],
+      "field_1": ["8", 0]
+    },
+    "class_type": "WebhookSend",
+    "_meta": {"title": "Webhook Send"}
+  },
+  "13": {
+    "inputs": {
+      "field": "image",
+      "debug": true,
+      "webhook_context": ["10", 0]
+    },
+    "class_type": "WebhookTransformer",
+    "_meta": {"title": "Extract Image"}
+  }
+}
