@@ -37,7 +37,11 @@ MIME_TYPES = {
     ".obj": "text/plain",
     ".stl": "model/stl",
     ".fbx": "application/octet-stream",
-    ".ply": "application/octet-stream",
+    ".ply": "application/x-ply",
+
+    # 3D/Depth formats
+    ".exr": "image/x-exr",
+    ".spz": "application/octet-stream",
 
     # Data/Other
     ".json": "application/json",

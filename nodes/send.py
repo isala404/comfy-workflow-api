@@ -13,7 +13,7 @@ from PIL import Image
 
 from ..core.types import WebhookContext, WebhookResult, OutputInfo
 from ..core.client import get_webhook_client
-from ..utils.helpers import format_size, run_async
+from ..utils.helpers import format_size, format_count, run_async
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +82,6 @@ class WebhookSend:
                     "default": False,
                     "tooltip": "Enable debug logging"
                 }),
-                # Batch outputs
-                "batch_outputs": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Send all items in batched outputs (images/masks). Field names become prefixes with _0, _1, etc. suffixes."
-                }),
             },
         }
 
@@ -110,7 +105,6 @@ class WebhookSend:
         field_5=None,
         field_5_name="output_5",
         debug=False,
-        batch_outputs=False,
     ):
         if not isinstance(webhook_context, WebhookContext):
             logger.warning("WebhookSend: Invalid webhook context")
@@ -134,7 +128,7 @@ class WebhookSend:
 
         try:
             result = run_async(
-                self._send_async(webhook_context, fields_to_send, debug, batch_outputs)
+                self._send_async(webhook_context, fields_to_send, debug)
             )
             return {}
         except Exception as e:
@@ -148,7 +142,6 @@ class WebhookSend:
         context: WebhookContext,
         fields_to_send: List[Tuple[str, Any]],
         debug: bool,
-        batch_outputs: bool = False,
     ):
         """Async implementation of send."""
         files = []
@@ -157,19 +150,13 @@ class WebhookSend:
 
         # Process each field
         for name, value in fields_to_send:
-            encoded = self._encode_value(name, value, batch_outputs)
+            encoded = self._encode_value(name, value)
             if encoded:
-                # Check if we got a list of encoded items (batched) or single item
-                if isinstance(encoded, list):
-                    # Batched output - expand with _N suffixes
-                    for i, (filename, data, mime_type, output_info) in enumerate(encoded):
-                        batch_name = f"{name}_{i}"
-                        files.append((batch_name, filename, data, mime_type))
-                        outputs.append(output_info.to_dict())
-                else:
-                    # Single item
-                    filename, data, mime_type, output_info = encoded
-                    files.append((name, filename, data, mime_type))
+                # _encode_value always returns a list of (filename, data, mime_type, output_info)
+                for filename, data, mime_type, output_info in encoded:
+                    # Extract field name from filename (e.g., "output_0.png" -> "output_0")
+                    field_name = filename.rsplit(".", 1)[0]
+                    files.append((field_name, filename, data, mime_type))
                     outputs.append(output_info.to_dict())
 
         # Build metadata
@@ -209,133 +196,95 @@ class WebhookSend:
         self,
         name: str,
         value: Any,
-        batch_outputs: bool = False,
-    ) -> Optional[Union[Tuple[str, bytes, str, OutputInfo], List[Tuple[str, bytes, str, OutputInfo]]]]:
+    ) -> Optional[List[Tuple[str, bytes, str, OutputInfo]]]:
         """
         Encode value to appropriate format for multipart upload.
 
+        Batched tensors (batch_size >= 1) automatically expand to field_0, field_1, etc.
+
         Returns:
-            tuple: (filename, data_bytes, mime_type, output_info) or None
-            list: List of tuples when batch_outputs=True and value is batched
+            List of (filename, data_bytes, mime_type, output_info) tuples, or None if encoding fails
         """
-        # IMAGE tensor
+        # IMAGE tensor [B, H, W, C]
         if torch.is_tensor(value) and len(value.shape) == 4:
-            # Batched images [B, H, W, C]
             batch_size = value.shape[0]
-
-            if batch_outputs and batch_size > 1:
-                # Return all images as separate items
-                results = []
-                for i in range(batch_size):
-                    img_bytes = self._tensor_to_png(value[i])
-                    filename = f"{name}_{i}.png"
-                    output_info = OutputInfo(
-                        type="IMAGE",
-                        filename=filename,
-                        mime_type="image/png",
-                        file_size_bytes=len(img_bytes),
-                        width=value.shape[2],
-                        height=value.shape[1],
-                        channels=value.shape[3] if len(value.shape) > 3 else 3,
-                        dtype="float32",
-                        format="png",
-                        batch_index=i,
-                        batch_size=batch_size,
-                    )
-                    results.append((filename, img_bytes, "image/png", output_info))
-                return results
-            else:
-                # Send only first image (original behavior)
-                data = self._tensor_to_png(value[0])
-                filename = f"{name}.png"
-
+            results = []
+            for i in range(batch_size):
+                img_bytes = self._tensor_to_png(value[i])
+                filename = f"{name}_{i}.png"
                 output_info = OutputInfo(
                     type="IMAGE",
                     filename=filename,
                     mime_type="image/png",
-                    file_size_bytes=len(data),
+                    file_size_bytes=len(img_bytes),
                     width=value.shape[2],
                     height=value.shape[1],
                     channels=value.shape[3] if len(value.shape) > 3 else 3,
                     dtype="float32",
                     format="png",
-                    batch_index=0,
+                    batch_index=i,
                     batch_size=batch_size,
                 )
-                return (filename, data, "image/png", output_info)
+                results.append((filename, img_bytes, "image/png", output_info))
+            return results
 
-        # MASK tensor [B, H, W] or [H, W] - check before IMAGE to avoid confusion
-        # Masks are 2D or 3D with small batch dimension (no color channel)
-        if torch.is_tensor(value) and len(value.shape) in (2, 3):
-            # Check if this looks like a mask:
-            # - 2D tensor [H, W] is definitely a mask
-            # - 3D tensor [B, H, W] where B < 10 is a batched mask
-            # - 3D tensor [H, W, C] where C is 3 or 4 is an image
-            is_mask = False
-            is_batched_mask = False
-            batch_size = 1
+        # MASK tensor [H, W] (single, unbatched)
+        if torch.is_tensor(value) and len(value.shape) == 2:
+            mask_bytes = self._mask_to_png(value)
+            filename = f"{name}_0.png"
+            output_info = OutputInfo(
+                type="MASK",
+                filename=filename,
+                mime_type="image/png",
+                file_size_bytes=len(mask_bytes),
+                width=value.shape[1],
+                height=value.shape[0],
+                format="png",
+                batch_index=0,
+                batch_size=1,
+            )
+            return [(filename, mask_bytes, "image/png", output_info)]
 
-            if len(value.shape) == 2:
-                is_mask = True
-            elif len(value.shape) == 3:
-                # [B, H, W] mask vs [H, W, C] image
-                # If last dim is 1, 3, or 4, it's likely an image
-                # If first dim is small and last dim is large, it's likely a mask batch
-                if value.shape[-1] not in (1, 3, 4) and value.shape[0] < 10:
-                    is_mask = True
-                    is_batched_mask = value.shape[0] > 1
-                    batch_size = value.shape[0]
-                elif value.shape[0] == 1 and value.shape[-1] > 10:
-                    # [1, H, W] is a batched mask
-                    is_mask = True
-                    is_batched_mask = False
-                    batch_size = 1
+        # MASK tensor [B, H, W] (batched) - distinguish from [H, W, C] image
+        if torch.is_tensor(value) and len(value.shape) == 3:
+            # [B, H, W] mask: last dim is NOT a color channel (1, 3, 4) and first dim is small
+            # [H, W, C] image: last dim IS a color channel
+            is_batched_mask = value.shape[-1] not in (1, 3, 4) and value.shape[0] < 10
+            # Also handle [1, H, W] as a single batched mask
+            if not is_batched_mask and value.shape[0] == 1 and value.shape[-1] > 10:
+                is_batched_mask = True
 
-            if is_mask:
-                if batch_outputs and is_batched_mask and batch_size > 1:
-                    # Return all masks as separate items
-                    results = []
-                    for i in range(batch_size):
-                        mask = value[i]
-                        mask_bytes = self._mask_to_png(mask)
-                        filename = f"{name}_{i}.png"
-                        output_info = OutputInfo(
-                            type="MASK",
-                            filename=filename,
-                            mime_type="image/png",
-                            file_size_bytes=len(mask_bytes),
-                            width=mask.shape[1],
-                            height=mask.shape[0],
-                            format="png",
-                            batch_index=i,
-                            batch_size=batch_size,
-                        )
-                        results.append((filename, mask_bytes, "image/png", output_info))
-                    return results
-                else:
-                    # Send only first mask (original behavior)
-                    mask = value[0] if len(value.shape) == 3 else value
-                    data = self._mask_to_png(mask)
-                    filename = f"{name}.png"
-
+            if is_batched_mask:
+                batch_size = value.shape[0]
+                results = []
+                for i in range(batch_size):
+                    mask = value[i]
+                    mask_bytes = self._mask_to_png(mask)
+                    filename = f"{name}_{i}.png"
                     output_info = OutputInfo(
                         type="MASK",
                         filename=filename,
                         mime_type="image/png",
-                        file_size_bytes=len(data),
+                        file_size_bytes=len(mask_bytes),
                         width=mask.shape[1],
                         height=mask.shape[0],
                         format="png",
-                        batch_index=0,
+                        batch_index=i,
                         batch_size=batch_size,
                     )
-                    return (filename, data, "image/png", output_info)
+                    results.append((filename, mask_bytes, "image/png", output_info))
+                return results
 
         # IMAGE tensor (single) [H, W, C]
         if torch.is_tensor(value) and len(value.shape) == 3:
-            data = self._tensor_to_png(value)
-            filename = f"{name}.png"
+            # Check for NORMAL_MAP first (3 channels, has negative values)
+            if value.shape[-1] == 3:
+                v_min = value.min().item()
+                if v_min < 0:
+                    return self._normal_map_to_result(name, value.unsqueeze(0))
 
+            data = self._tensor_to_png(value)
+            filename = f"{name}_0.png"
             output_info = OutputInfo(
                 type="IMAGE",
                 filename=filename,
@@ -346,14 +295,16 @@ class WebhookSend:
                 channels=value.shape[2] if len(value.shape) > 2 else 3,
                 dtype="float32",
                 format="png",
+                batch_index=0,
+                batch_size=1,
             )
-            return (filename, data, "image/png", output_info)
+            return [(filename, data, "image/png", output_info)]
 
         # AUDIO dict
         if isinstance(value, dict) and "waveform" in value:
             data = self._audio_to_flac(value)
             if data:
-                filename = f"{name}.flac"
+                filename = f"{name}_0.flac"
                 output_info = OutputInfo(
                     type="AUDIO",
                     filename=filename,
@@ -361,8 +312,23 @@ class WebhookSend:
                     file_size_bytes=len(data),
                     sample_rate=value.get("sample_rate", 44100),
                     format="flac",
+                    batch_index=0,
+                    batch_size=1,
                 )
-                return (filename, data, "audio/flac", output_info)
+                return [(filename, data, "audio/flac", output_info)]
+
+        # GAUSSIAN_SPLATTING dict (has positions + opacity/scales/sh_coefficients)
+        if isinstance(value, dict) and "positions" in value:
+            if "opacity" in value or "scales" in value or "sh_coefficients" in value:
+                return self._gaussian_to_result(name, value)
+
+        # POINT_CLOUD dict (has points but no gaussian properties)
+        if isinstance(value, dict) and "points" in value and "opacity" not in value:
+            return self._point_cloud_to_result(name, value)
+
+        # CAMERA_POSES dict (has poses or cameras)
+        if isinstance(value, dict) and ("poses" in value or "cameras" in value):
+            return self._camera_poses_to_result(name, value)
 
         # VIDEO - ComfyUI VideoFromComponents (new API with get_components method)
         if hasattr(value, "get_components") and callable(value.get_components):
@@ -380,7 +346,7 @@ class WebhookSend:
 
                     data = self._video_to_mp4(video_dict)
                     if data:
-                        filename = f"{name}.mp4"
+                        filename = f"{name}_0.mp4"
                         output_info = OutputInfo(
                             type="VIDEO",
                             filename=filename,
@@ -389,8 +355,10 @@ class WebhookSend:
                             width=images.shape[2] if torch.is_tensor(images) else None,
                             height=images.shape[1] if torch.is_tensor(images) else None,
                             format="mp4",
+                            batch_index=0,
+                            batch_size=1,
                         )
-                        return (filename, data, "video/mp4", output_info)
+                        return [(filename, data, "video/mp4", output_info)]
                     else:
                         logger.warning(f"WebhookSend: Failed to encode video for field '{name}'")
             except Exception as e:
@@ -406,8 +374,7 @@ class WebhookSend:
                 video_dict["audio"] = value.audio
             data = self._video_to_mp4(video_dict)
             if data:
-                filename = f"{name}.mp4"
-                fps = video_dict["fps"]
+                filename = f"{name}_0.mp4"
                 images = video_dict["images"]
                 output_info = OutputInfo(
                     type="VIDEO",
@@ -417,15 +384,16 @@ class WebhookSend:
                     width=images.shape[2] if torch.is_tensor(images) else None,
                     height=images.shape[1] if torch.is_tensor(images) else None,
                     format="mp4",
+                    batch_index=0,
+                    batch_size=1,
                 )
-                return (filename, data, "video/mp4", output_info)
+                return [(filename, data, "video/mp4", output_info)]
 
         # VIDEO dict or tensor
         if isinstance(value, dict) and "images" in value:
             data = self._video_to_mp4(value)
             if data:
-                filename = f"{name}.mp4"
-                fps = value.get("fps", 24)
+                filename = f"{name}_0.mp4"
                 images = value.get("images")
                 output_info = OutputInfo(
                     type="VIDEO",
@@ -435,58 +403,63 @@ class WebhookSend:
                     width=images.shape[2] if torch.is_tensor(images) else None,
                     height=images.shape[1] if torch.is_tensor(images) else None,
                     format="mp4",
+                    batch_index=0,
+                    batch_size=1,
                 )
-                return (filename, data, "video/mp4", output_info)
+                return [(filename, data, "video/mp4", output_info)]
 
         # MESH dict
         if isinstance(value, dict) and ("vertices" in value or "faces" in value):
             data = self._mesh_to_glb(value)
             if data:
-                filename = f"{name}.glb"
-                vertices = value.get("vertices")
-                faces = value.get("faces")
+                filename = f"{name}_0.glb"
                 output_info = OutputInfo(
                     type="MESH",
                     filename=filename,
                     mime_type="model/gltf-binary",
                     file_size_bytes=len(data),
                     format="glb",
+                    batch_index=0,
+                    batch_size=1,
                 )
-                return (filename, data, "model/gltf-binary", output_info)
+                return [(filename, data, "model/gltf-binary", output_info)]
 
         # LATENT dict
         if isinstance(value, dict) and "samples" in value:
             data = self._latent_to_safetensors(value)
             if data:
-                filename = f"{name}.safetensors"
-                samples = value.get("samples")
+                filename = f"{name}_0.safetensors"
                 output_info = OutputInfo(
                     type="LATENT",
                     filename=filename,
                     mime_type="application/octet-stream",
                     file_size_bytes=len(data),
                     format="safetensors",
+                    batch_index=0,
+                    batch_size=1,
                 )
-                return (filename, data, "application/octet-stream", output_info)
+                return [(filename, data, "application/octet-stream", output_info)]
 
         # STRING
         if isinstance(value, str):
             data = value.encode("utf-8")
-            filename = f"{name}.txt"
+            filename = f"{name}_0.txt"
             output_info = OutputInfo(
                 type="STRING",
                 filename=filename,
                 mime_type="text/plain",
                 file_size_bytes=len(data),
                 inline_content=value if len(value) < 1000 else None,
+                batch_index=0,
+                batch_size=1,
             )
-            return (filename, data, "text/plain", output_info)
+            return [(filename, data, "text/plain", output_info)]
 
         # INT, FLOAT, BOOLEAN
         if isinstance(value, (int, float, bool)):
             str_value = str(value).lower() if isinstance(value, bool) else str(value)
             data = str_value.encode("utf-8")
-            filename = f"{name}.txt"
+            filename = f"{name}_0.txt"
             type_name = type(value).__name__.upper()
             output_info = OutputInfo(
                 type=type_name,
@@ -494,32 +467,38 @@ class WebhookSend:
                 mime_type="text/plain",
                 file_size_bytes=len(data),
                 inline_content=str_value,
+                batch_index=0,
+                batch_size=1,
             )
-            return (filename, data, "text/plain", output_info)
+            return [(filename, data, "text/plain", output_info)]
 
         # BYTES
         if isinstance(value, bytes):
-            filename = f"{name}.bin"
+            filename = f"{name}_0.bin"
             output_info = OutputInfo(
                 type="BYTES",
                 filename=filename,
                 mime_type="application/octet-stream",
                 file_size_bytes=len(value),
+                batch_index=0,
+                batch_size=1,
             )
-            return (filename, value, "application/octet-stream", output_info)
+            return [(filename, value, "application/octet-stream", output_info)]
 
         # Try JSON serialization for other types
         try:
             json_str = json.dumps(value, default=str)
             data = json_str.encode("utf-8")
-            filename = f"{name}.json"
+            filename = f"{name}_0.json"
             output_info = OutputInfo(
                 type="JSON",
                 filename=filename,
                 mime_type="application/json",
                 file_size_bytes=len(data),
+                batch_index=0,
+                batch_size=1,
             )
-            return (filename, data, "application/json", output_info)
+            return [(filename, data, "application/json", output_info)]
         except Exception:
             pass
 
@@ -750,6 +729,374 @@ class WebhookSend:
             logger.error(f"Failed to encode latent: {e}")
             return None
 
+    def _encode_ply_binary(
+        self,
+        positions: np.ndarray,
+        properties: List[Tuple[str, str, np.ndarray]],
+    ) -> bytes:
+        """Encode point data to binary PLY format."""
+        point_count = len(positions)
+
+        # Build header
+        header_lines = [
+            "ply",
+            "format binary_little_endian 1.0",
+            f"element vertex {point_count}",
+            "property float x",
+            "property float y",
+            "property float z",
+        ]
+
+        for prop_name, prop_type, _ in properties:
+            header_lines.append(f"property {prop_type} {prop_name}")
+
+        header_lines.append("end_header\n")
+        header = "\n".join(header_lines).encode("ascii")
+
+        # Build binary data
+        buffer = io.BytesIO()
+        buffer.write(header)
+
+        positions = positions.astype(np.float32)
+        for i in range(point_count):
+            buffer.write(positions[i].tobytes())
+            for _, _, data in properties:
+                buffer.write(data[i].tobytes())
+
+        return buffer.getvalue()
+
+    def _gaussian_to_result(
+        self,
+        name: str,
+        value: dict,
+    ) -> List[Tuple[str, bytes, str, OutputInfo]]:
+        """Convert Gaussian Splatting dict to PLY result."""
+        try:
+            positions = value.get("positions")
+            if positions is None:
+                return []
+
+            if torch.is_tensor(positions):
+                positions = positions.cpu().numpy()
+
+            if len(positions.shape) == 3:
+                positions = positions[0]
+
+            point_count = len(positions)
+            properties = []
+
+            # Collect optional properties
+            if "scales" in value:
+                scales = value["scales"]
+                if torch.is_tensor(scales):
+                    scales = scales.cpu().numpy()
+                if len(scales.shape) == 3:
+                    scales = scales[0]
+                for i in range(scales.shape[-1]):
+                    properties.append((f"scale_{i}", "float", scales[:, i].astype(np.float32)))
+
+            if "rotations" in value:
+                rotations = value["rotations"]
+                if torch.is_tensor(rotations):
+                    rotations = rotations.cpu().numpy()
+                if len(rotations.shape) == 3:
+                    rotations = rotations[0]
+                for i in range(rotations.shape[-1]):
+                    properties.append((f"rot_{i}", "float", rotations[:, i].astype(np.float32)))
+
+            if "opacity" in value:
+                opacity = value["opacity"]
+                if torch.is_tensor(opacity):
+                    opacity = opacity.cpu().numpy()
+                if len(opacity.shape) == 2:
+                    opacity = opacity[0]
+                opacity = opacity.flatten().astype(np.float32)
+                properties.append(("opacity", "float", opacity))
+
+            has_sh = "sh_coefficients" in value
+            if has_sh:
+                sh = value["sh_coefficients"]
+                if torch.is_tensor(sh):
+                    sh = sh.cpu().numpy()
+                if len(sh.shape) == 4:
+                    sh = sh[0]
+                # Flatten SH coefficients
+                sh_flat = sh.reshape(point_count, -1)
+                for i in range(sh_flat.shape[-1]):
+                    properties.append((f"f_dc_{i}" if i < 3 else f"f_rest_{i-3}", "float", sh_flat[:, i].astype(np.float32)))
+
+            data = self._encode_ply_binary(positions, properties)
+            filename = f"{name}_0.ply"
+
+            output_info = OutputInfo(
+                type="GAUSSIAN_SPLATTING",
+                filename=filename,
+                mime_type="application/x-ply",
+                file_size_bytes=len(data),
+                format="ply",
+                point_count=point_count,
+                has_sh_coefficients=has_sh,
+                batch_index=0,
+                batch_size=1,
+            )
+            return [(filename, data, "application/x-ply", output_info)]
+
+        except Exception as e:
+            logger.error(f"Failed to encode gaussian splatting: {e}")
+            return []
+
+    def _point_cloud_to_result(
+        self,
+        name: str,
+        value: dict,
+    ) -> List[Tuple[str, bytes, str, OutputInfo]]:
+        """Convert Point Cloud dict to PLY result."""
+        try:
+            points = value.get("points")
+            if points is None:
+                return []
+
+            if torch.is_tensor(points):
+                points = points.cpu().numpy()
+
+            if len(points.shape) == 3:
+                points = points[0]
+
+            point_count = len(points)
+            properties = []
+
+            # Colors
+            if "colors" in value:
+                colors = value["colors"]
+                if torch.is_tensor(colors):
+                    colors = colors.cpu().numpy()
+                if len(colors.shape) == 3:
+                    colors = colors[0]
+                # Convert to uint8 if needed
+                if colors.max() <= 1.0:
+                    colors = (colors * 255).astype(np.uint8)
+                else:
+                    colors = colors.astype(np.uint8)
+                properties.append(("red", "uchar", colors[:, 0]))
+                properties.append(("green", "uchar", colors[:, 1]))
+                properties.append(("blue", "uchar", colors[:, 2]))
+
+            # Normals
+            if "normals" in value:
+                normals = value["normals"]
+                if torch.is_tensor(normals):
+                    normals = normals.cpu().numpy()
+                if len(normals.shape) == 3:
+                    normals = normals[0]
+                properties.append(("nx", "float", normals[:, 0].astype(np.float32)))
+                properties.append(("ny", "float", normals[:, 1].astype(np.float32)))
+                properties.append(("nz", "float", normals[:, 2].astype(np.float32)))
+
+            data = self._encode_ply_binary(points, properties)
+            filename = f"{name}_0.ply"
+
+            output_info = OutputInfo(
+                type="POINT_CLOUD",
+                filename=filename,
+                mime_type="application/x-ply",
+                file_size_bytes=len(data),
+                format="ply",
+                point_count=point_count,
+                batch_index=0,
+                batch_size=1,
+            )
+            return [(filename, data, "application/x-ply", output_info)]
+
+        except Exception as e:
+            logger.error(f"Failed to encode point cloud: {e}")
+            return []
+
+    def _depth_map_to_result(
+        self,
+        name: str,
+        value: torch.Tensor,
+    ) -> List[Tuple[str, bytes, str, OutputInfo]]:
+        """Convert depth map tensor to EXR or PNG16 result."""
+        try:
+            if len(value.shape) == 3:
+                batch_size = value.shape[0]
+            else:
+                value = value.unsqueeze(0)
+                batch_size = 1
+
+            results = []
+            for i in range(batch_size):
+                depth = value[i].cpu().numpy()
+                depth_min = float(depth.min())
+                depth_max = float(depth.max())
+
+                # Try EXR first (preferred for metric depth)
+                try:
+                    import OpenEXR
+                    import Imath
+                    import tempfile
+                    import os
+
+                    height, width = depth.shape
+                    header = OpenEXR.Header(width, height)
+                    header["compression"] = Imath.Compression(Imath.Compression.ZIP_COMPRESSION)
+                    # Single Y channel for depth (not RGB)
+                    header["channels"] = {"Y": Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))}
+
+                    exr_data = depth.astype(np.float32).tobytes()
+
+                    # OpenEXR requires file path, use temp with proper cleanup
+                    temp_path = None
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".exr", delete=False) as f:
+                            temp_path = f.name
+
+                        out = OpenEXR.OutputFile(temp_path, header)
+                        out.writePixels({"Y": exr_data})
+                        out.close()
+
+                        with open(temp_path, "rb") as f:
+                            data = f.read()
+                    finally:
+                        if temp_path and os.path.exists(temp_path):
+                            os.unlink(temp_path)
+
+                    filename = f"{name}_{i}.exr"
+                    mime_type = "image/x-exr"
+                    fmt = "exr"
+
+                except ImportError:
+                    # Fallback to 16-bit PNG
+                    depth_normalized = (depth - depth_min) / (depth_max - depth_min + 1e-8)
+                    depth_16bit = (depth_normalized * 65535).astype(np.uint16)
+                    pil_image = Image.fromarray(depth_16bit, mode="I;16")
+
+                    buffer = io.BytesIO()
+                    pil_image.save(buffer, format="PNG")
+                    data = buffer.getvalue()
+
+                    filename = f"{name}_{i}.png"
+                    mime_type = "image/png"
+                    fmt = "png16"
+
+                output_info = OutputInfo(
+                    type="DEPTH_MAP",
+                    filename=filename,
+                    mime_type=mime_type,
+                    file_size_bytes=len(data),
+                    format=fmt,
+                    width=depth.shape[1],
+                    height=depth.shape[0],
+                    depth_min=depth_min,
+                    depth_max=depth_max,
+                    batch_index=i,
+                    batch_size=batch_size,
+                )
+                results.append((filename, data, mime_type, output_info))
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Failed to encode depth map: {e}")
+            return []
+
+    def _normal_map_to_result(
+        self,
+        name: str,
+        value: torch.Tensor,
+    ) -> List[Tuple[str, bytes, str, OutputInfo]]:
+        """Convert normal map tensor [B, H, W, 3] to PNG result."""
+        try:
+            if len(value.shape) == 3:
+                value = value.unsqueeze(0)
+
+            batch_size = value.shape[0]
+            results = []
+
+            for i in range(batch_size):
+                normals = value[i].cpu().numpy()
+
+                # Convert from [-1, 1] to [0, 255]
+                normals_uint8 = ((normals + 1.0) * 0.5 * 255).clip(0, 255).astype(np.uint8)
+                pil_image = Image.fromarray(normals_uint8)
+
+                buffer = io.BytesIO()
+                pil_image.save(buffer, format="PNG")
+                data = buffer.getvalue()
+
+                filename = f"{name}_{i}.png"
+                output_info = OutputInfo(
+                    type="NORMAL_MAP",
+                    filename=filename,
+                    mime_type="image/png",
+                    file_size_bytes=len(data),
+                    format="png",
+                    width=normals.shape[1],
+                    height=normals.shape[0],
+                    channels=3,
+                    batch_index=i,
+                    batch_size=batch_size,
+                )
+                results.append((filename, data, "image/png", output_info))
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Failed to encode normal map: {e}")
+            return []
+
+    def _camera_poses_to_result(
+        self,
+        name: str,
+        value: dict,
+    ) -> List[Tuple[str, bytes, str, OutputInfo]]:
+        """Convert camera poses dict to JSON result."""
+        try:
+            poses = value.get("poses") or value.get("cameras")
+            if poses is None:
+                return []
+
+            if torch.is_tensor(poses):
+                poses = poses.cpu().numpy().tolist()
+            elif isinstance(poses, np.ndarray):
+                poses = poses.tolist()
+
+            camera_count = len(poses) if isinstance(poses, list) else 1
+
+            output_dict = {"poses": poses}
+
+            # Include intrinsics if present
+            has_intrinsics = False
+            if "intrinsics" in value:
+                intrinsics = value["intrinsics"]
+                if torch.is_tensor(intrinsics):
+                    intrinsics = intrinsics.cpu().numpy().tolist()
+                elif isinstance(intrinsics, np.ndarray):
+                    intrinsics = intrinsics.tolist()
+                output_dict["intrinsics"] = intrinsics
+                has_intrinsics = True
+
+            json_str = json.dumps(output_dict)
+            data = json_str.encode("utf-8")
+            filename = f"{name}_0.json"
+
+            output_info = OutputInfo(
+                type="CAMERA_POSES",
+                filename=filename,
+                mime_type="application/json",
+                file_size_bytes=len(data),
+                format="json",
+                camera_count=camera_count,
+                has_intrinsics=has_intrinsics,
+                batch_index=0,
+                batch_size=1,
+            )
+            return [(filename, data, "application/json", output_info)]
+
+        except Exception as e:
+            logger.error(f"Failed to encode camera poses: {e}")
+            return []
+
     def _print_debug(
         self,
         context: WebhookContext,
@@ -787,6 +1134,28 @@ class WebhookSend:
                 w = output.get("width", "?")
                 h = output.get("height", "?")
                 lines.append(f"{prefix} {name:20} ({type_name}) {w}x{h}, PNG, {format_size(len(data))}")
+            elif type_name == "NORMAL_MAP":
+                w = output.get("width", "?")
+                h = output.get("height", "?")
+                lines.append(f"{prefix} {name:20} ({type_name}) {w}x{h}, PNG, {format_size(len(data))}")
+            elif type_name == "DEPTH_MAP":
+                w = output.get("width", "?")
+                h = output.get("height", "?")
+                fmt = output.get("format", "?")
+                d_min = output.get("depth_min", "?")
+                d_max = output.get("depth_max", "?")
+                lines.append(f"{prefix} {name:20} ({type_name}) {w}x{h}, {fmt}, range=[{d_min:.2f}, {d_max:.2f}], {format_size(len(data))}")
+            elif type_name == "GAUSSIAN_SPLATTING":
+                pts = format_count(output.get("point_count", 0))
+                has_sh = "SH" if output.get("has_sh_coefficients") else "no-SH"
+                lines.append(f"{prefix} {name:20} ({type_name}) {pts} points, {has_sh}, PLY, {format_size(len(data))}")
+            elif type_name == "POINT_CLOUD":
+                pts = format_count(output.get("point_count", 0))
+                lines.append(f"{prefix} {name:20} ({type_name}) {pts} points, PLY, {format_size(len(data))}")
+            elif type_name == "CAMERA_POSES":
+                cams = output.get("camera_count", "?")
+                has_k = "K" if output.get("has_intrinsics") else "no-K"
+                lines.append(f"{prefix} {name:20} ({type_name}) {cams} cameras, {has_k}, JSON, {format_size(len(data))}")
             elif type_name == "STRING":
                 content = output.get("inline_content")
                 if content and len(content) < 30:

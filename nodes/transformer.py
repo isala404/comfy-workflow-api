@@ -204,13 +204,45 @@ class WebhookTransformer:
             debug_info["dtype"] = str(raw_value.dtype)
             return (raw_value, "TENSOR", debug_info)
 
-        # Handle dicts (could be LATENT, AUDIO, etc.)
+        # Handle dicts (could be LATENT, AUDIO, 3D types, etc.)
         if isinstance(raw_value, dict):
-            # Check for known dict types
+            # Check for known dict types in order of specificity
+
+            # GAUSSIAN_SPLATTING (has positions + opacity/scales/sh_coefficients)
+            if "positions" in raw_value and ("opacity" in raw_value or "scales" in raw_value or "sh_coefficients" in raw_value):
+                point_count = 0
+                if "positions" in raw_value:
+                    pos = raw_value["positions"]
+                    if torch.is_tensor(pos):
+                        point_count = pos.shape[-2] if len(pos.shape) >= 2 else pos.numel() // 3
+                    elif hasattr(pos, "__len__"):
+                        point_count = len(pos)
+                return (raw_value, "GAUSSIAN_SPLATTING", {"type": "gaussian_dict", "point_count": point_count})
+
+            # POINT_CLOUD (has points but no gaussian properties)
+            if "points" in raw_value and "opacity" not in raw_value:
+                point_count = 0
+                pts = raw_value["points"]
+                if torch.is_tensor(pts):
+                    point_count = pts.shape[-2] if len(pts.shape) >= 2 else pts.numel() // 3
+                elif hasattr(pts, "__len__"):
+                    point_count = len(pts)
+                return (raw_value, "POINT_CLOUD", {"type": "point_cloud_dict", "point_count": point_count})
+
+            # CAMERA_POSES (has poses or cameras)
+            if "poses" in raw_value or "cameras" in raw_value:
+                poses = raw_value.get("poses") or raw_value.get("cameras")
+                camera_count = len(poses) if isinstance(poses, (list, tuple)) else 1
+                return (raw_value, "CAMERA_POSES", {"type": "camera_dict", "camera_count": camera_count})
+
             if "samples" in raw_value:
                 return (raw_value, "LATENT", {"type": "latent_dict"})
             if "waveform" in raw_value:
                 return (raw_value, "AUDIO", {"type": "audio_dict"})
+            if "images" in raw_value:
+                return (raw_value, "VIDEO", {"type": "video_dict"})
+            if "vertices" in raw_value or "faces" in raw_value:
+                return (raw_value, "MESH", {"type": "mesh_dict"})
 
             # Generic dict - return as is
             debug_info["keys"] = list(raw_value.keys())
@@ -525,6 +557,26 @@ class WebhookTransformer:
         elif value_type == "MESH":
             lines.append(f"  Vertices: {debug_info.get('vertex_count', 'unknown')}")
             lines.append(f"  Faces:    {debug_info.get('face_count', 'unknown')}")
+
+        elif value_type == "GAUSSIAN_SPLATTING":
+            lines.append(f"  Points:   {debug_info.get('point_count', 'unknown')}")
+            lines.append(f"  Source:   {debug_info.get('type', 'unknown')}")
+
+        elif value_type == "POINT_CLOUD":
+            lines.append(f"  Points:   {debug_info.get('point_count', 'unknown')}")
+            lines.append(f"  Source:   {debug_info.get('type', 'unknown')}")
+
+        elif value_type == "CAMERA_POSES":
+            lines.append(f"  Cameras:  {debug_info.get('camera_count', 'unknown')}")
+            lines.append(f"  Source:   {debug_info.get('type', 'unknown')}")
+
+        elif value_type == "DEPTH_MAP":
+            lines.append(f"  Dimensions: {debug_info.get('dimensions', 'unknown')}")
+            lines.append(f"  Range:    [{debug_info.get('depth_min', '?')}, {debug_info.get('depth_max', '?')}]")
+
+        elif value_type == "NORMAL_MAP":
+            lines.append(f"  Dimensions: {debug_info.get('dimensions', 'unknown')}")
+            lines.append(f"  Source:   {debug_info.get('source', 'unknown')}")
 
         else:
             # Generic info

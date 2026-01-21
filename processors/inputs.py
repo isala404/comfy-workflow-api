@@ -555,6 +555,8 @@ class WebhookInputProcessor:
         # Detect format
         if data.startswith(b'glTF'):
             return self._parse_glb(data)
+        elif data.startswith(b'ply\n') or data.startswith(b'ply\r\n'):
+            return self._parse_ply(data)
         elif data.startswith(b'solid ') or data[:80].count(b'\x00') < 10:
             # Text STL or ASCII format
             if b'v ' in data[:1000]:
@@ -569,6 +571,10 @@ class WebhookInputProcessor:
                     return self._parse_stl_binary(data)
             except:
                 pass
+
+        # Check hint for PLY extension
+        if hint.lower().endswith('.ply'):
+            return self._parse_ply(data)
 
         # Try OBJ as fallback for text formats
         if b'v ' in data[:1000]:
@@ -744,3 +750,317 @@ class WebhookInputProcessor:
             logger.error(f"Failed to parse STL: {e}")
 
         return default_mesh
+
+    def _parse_ply(self, data: bytes) -> dict:
+        """
+        Parse PLY file.
+
+        Detects whether it's a Gaussian Splatting file or a regular point cloud/mesh.
+        Returns appropriate dict structure.
+        """
+        import struct
+
+        default_result = {
+            "vertices": torch.zeros(1, 3, 3),
+            "faces": torch.zeros(1, 1, 3, dtype=torch.long)
+        }
+
+        try:
+            # Find header end
+            header_end = data.find(b'end_header')
+            if header_end == -1:
+                return default_result
+
+            header = data[:header_end].decode('ascii', errors='ignore')
+
+            # Handle both Unix (\n) and Windows (\r\n) line endings
+            body_start = header_end + len(b'end_header')
+            if data[body_start:body_start + 2] == b'\r\n':
+                body_start += 2
+            elif data[body_start:body_start + 1] == b'\n':
+                body_start += 1
+
+            # Parse header
+            lines = header.split('\n')
+            vertex_count = 0
+            face_count = 0
+            properties = []
+            is_binary_le = False
+            is_binary_be = False
+
+            for line in lines:
+                line = line.strip()
+                if line.startswith('format binary_little_endian'):
+                    is_binary_le = True
+                elif line.startswith('format binary_big_endian'):
+                    is_binary_be = True
+                elif line.startswith('element vertex'):
+                    vertex_count = int(line.split()[-1])
+                elif line.startswith('element face'):
+                    face_count = int(line.split()[-1])
+                elif line.startswith('property'):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        prop_type = parts[1]
+                        prop_name = parts[2]
+                        properties.append((prop_name, prop_type))
+
+            # Detect if this is a Gaussian Splatting file
+            prop_names = [p[0] for p in properties]
+            is_gaussian = 'opacity' in prop_names or any(p.startswith('f_dc_') or p.startswith('scale_') for p in prop_names)
+
+            if is_binary_le or is_binary_be:
+                return self._parse_ply_binary(
+                    data[body_start:], vertex_count, face_count, properties,
+                    is_gaussian, little_endian=is_binary_le
+                )
+            else:
+                return self._parse_ply_ascii(
+                    data[body_start:].decode('ascii', errors='ignore'),
+                    vertex_count, face_count, properties, is_gaussian
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to parse PLY: {e}")
+            return default_result
+
+    def _parse_ply_binary(
+        self,
+        body: bytes,
+        vertex_count: int,
+        face_count: int,
+        properties: list,
+        is_gaussian: bool,
+        little_endian: bool = True
+    ) -> dict:
+        """Parse binary PLY data."""
+        import struct
+
+        endian = '<' if little_endian else '>'
+
+        # Calculate vertex stride and build format string
+        type_map = {
+            'float': ('f', 4),
+            'float32': ('f', 4),
+            'double': ('d', 8),
+            'float64': ('d', 8),
+            'uchar': ('B', 1),
+            'uint8': ('B', 1),
+            'char': ('b', 1),
+            'int8': ('b', 1),
+            'ushort': ('H', 2),
+            'uint16': ('H', 2),
+            'short': ('h', 2),
+            'int16': ('h', 2),
+            'uint': ('I', 4),
+            'uint32': ('I', 4),
+            'int': ('i', 4),
+            'int32': ('i', 4),
+        }
+
+        vertex_format = endian
+        vertex_stride = 0
+        prop_offsets = {}
+
+        for prop_name, prop_type in properties:
+            if prop_type in type_map:
+                fmt_char, size = type_map[prop_type]
+                prop_offsets[prop_name] = (vertex_stride, fmt_char, size)
+                vertex_format += fmt_char
+                vertex_stride += size
+
+        # Validate vertex count against actual data size (security check)
+        if vertex_stride > 0:
+            max_possible_vertices = len(body) // vertex_stride
+            if vertex_count > max_possible_vertices:
+                logger.warning(
+                    f"PLY claims {vertex_count} vertices but data only supports {max_possible_vertices}"
+                )
+                vertex_count = max_possible_vertices
+
+        # Read all vertex data
+        all_data = []
+        offset = 0
+        for i in range(vertex_count):
+            if offset + vertex_stride > len(body):
+                break
+            vertex_data = struct.unpack(vertex_format, body[offset:offset + vertex_stride])
+            all_data.append(vertex_data)
+            offset += vertex_stride
+
+        # Extract positions (x, y, z)
+        positions = []
+        x_idx = [i for i, (n, _) in enumerate(properties) if n == 'x']
+        y_idx = [i for i, (n, _) in enumerate(properties) if n == 'y']
+        z_idx = [i for i, (n, _) in enumerate(properties) if n == 'z']
+
+        if x_idx and y_idx and z_idx:
+            x_idx, y_idx, z_idx = x_idx[0], y_idx[0], z_idx[0]
+            for vertex in all_data:
+                positions.append([vertex[x_idx], vertex[y_idx], vertex[z_idx]])
+
+        positions = np.array(positions, dtype=np.float32)
+
+        if is_gaussian:
+            # Build Gaussian Splatting result
+            result = {
+                "positions": torch.from_numpy(positions).unsqueeze(0)
+            }
+
+            # Extract opacity
+            opacity_idx = [i for i, (n, _) in enumerate(properties) if n == 'opacity']
+            if opacity_idx:
+                opacity = np.array([v[opacity_idx[0]] for v in all_data], dtype=np.float32)
+                result["opacity"] = torch.from_numpy(opacity).unsqueeze(0)
+
+            # Extract scales
+            scale_indices = [(i, n) for i, (n, _) in enumerate(properties) if n.startswith('scale_')]
+            if scale_indices:
+                scale_indices.sort(key=lambda x: x[1])
+                scales = np.array([[v[idx] for idx, _ in scale_indices] for v in all_data], dtype=np.float32)
+                result["scales"] = torch.from_numpy(scales).unsqueeze(0)
+
+            # Extract rotations
+            rot_indices = [(i, n) for i, (n, _) in enumerate(properties) if n.startswith('rot_')]
+            if rot_indices:
+                rot_indices.sort(key=lambda x: x[1])
+                rotations = np.array([[v[idx] for idx, _ in rot_indices] for v in all_data], dtype=np.float32)
+                result["rotations"] = torch.from_numpy(rotations).unsqueeze(0)
+
+            # Extract SH coefficients
+            sh_indices = [(i, n) for i, (n, _) in enumerate(properties) if n.startswith('f_dc_') or n.startswith('f_rest_')]
+            if sh_indices:
+                sh_indices.sort(key=lambda x: (0 if 'f_dc_' in x[1] else 1, x[1]))
+                sh_data = np.array([[v[idx] for idx, _ in sh_indices] for v in all_data], dtype=np.float32)
+                result["sh_coefficients"] = torch.from_numpy(sh_data).unsqueeze(0)
+
+            return result
+
+        else:
+            # Regular point cloud or mesh
+            result = {
+                "points": torch.from_numpy(positions).unsqueeze(0)
+            }
+
+            # Extract colors
+            r_idx = [i for i, (n, _) in enumerate(properties) if n in ('red', 'r')]
+            g_idx = [i for i, (n, _) in enumerate(properties) if n in ('green', 'g')]
+            b_idx = [i for i, (n, _) in enumerate(properties) if n in ('blue', 'b')]
+
+            if r_idx and g_idx and b_idx:
+                colors = np.array([
+                    [v[r_idx[0]], v[g_idx[0]], v[b_idx[0]]]
+                    for v in all_data
+                ], dtype=np.float32)
+                # Normalize if values are > 1
+                if colors.max() > 1.0:
+                    colors = colors / 255.0
+                result["colors"] = torch.from_numpy(colors).unsqueeze(0)
+
+            # Extract normals
+            nx_idx = [i for i, (n, _) in enumerate(properties) if n == 'nx']
+            ny_idx = [i for i, (n, _) in enumerate(properties) if n == 'ny']
+            nz_idx = [i for i, (n, _) in enumerate(properties) if n == 'nz']
+
+            if nx_idx and ny_idx and nz_idx:
+                normals = np.array([
+                    [v[nx_idx[0]], v[ny_idx[0]], v[nz_idx[0]]]
+                    for v in all_data
+                ], dtype=np.float32)
+                result["normals"] = torch.from_numpy(normals).unsqueeze(0)
+
+            # For mesh compatibility
+            if face_count == 0:
+                result["vertices"] = result["points"]
+                result["faces"] = torch.zeros(1, 0, 3, dtype=torch.long)
+
+            return result
+
+    def _parse_ply_ascii(
+        self,
+        body: str,
+        vertex_count: int,
+        face_count: int,
+        properties: list,
+        is_gaussian: bool
+    ) -> dict:
+        """Parse ASCII PLY data."""
+        lines = body.strip().split('\n')
+        prop_names = [p[0] for p in properties]
+
+        vertices = []
+        for i in range(min(vertex_count, len(lines))):
+            values = lines[i].split()
+            vertex = {}
+            for j, val in enumerate(values):
+                if j < len(prop_names):
+                    try:
+                        vertex[prop_names[j]] = float(val)
+                    except ValueError:
+                        vertex[prop_names[j]] = 0.0
+            vertices.append(vertex)
+
+        # Extract positions
+        positions = np.array([
+            [v.get('x', 0), v.get('y', 0), v.get('z', 0)]
+            for v in vertices
+        ], dtype=np.float32)
+
+        if is_gaussian:
+            result = {"positions": torch.from_numpy(positions).unsqueeze(0)}
+
+            if 'opacity' in prop_names:
+                opacity = np.array([v.get('opacity', 1.0) for v in vertices], dtype=np.float32)
+                result["opacity"] = torch.from_numpy(opacity).unsqueeze(0)
+
+            return result
+        else:
+            return {
+                "points": torch.from_numpy(positions).unsqueeze(0),
+                "vertices": torch.from_numpy(positions).unsqueeze(0),
+                "faces": torch.zeros(1, 0, 3, dtype=torch.long)
+            }
+
+    def _parse_exr(self, data: bytes) -> torch.Tensor:
+        """Parse EXR depth map file."""
+        try:
+            import OpenEXR
+            import Imath
+            import tempfile
+            import os
+
+            # OpenEXR requires a file path
+            with tempfile.NamedTemporaryFile(suffix=".exr", delete=False) as f:
+                f.write(data)
+                temp_path = f.name
+
+            try:
+                exr_file = OpenEXR.InputFile(temp_path)
+                header = exr_file.header()
+                dw = header['dataWindow']
+                width = dw.max.x - dw.min.x + 1
+                height = dw.max.y - dw.min.y + 1
+
+                # Read the R channel (depth is usually in R or Y)
+                pt = Imath.PixelType(Imath.PixelType.FLOAT)
+                channels = exr_file.header()['channels'].keys()
+
+                if 'R' in channels:
+                    channel_data = exr_file.channel('R', pt)
+                elif 'Y' in channels:
+                    channel_data = exr_file.channel('Y', pt)
+                else:
+                    channel_data = exr_file.channel(list(channels)[0], pt)
+
+                depth = np.frombuffer(channel_data, dtype=np.float32).reshape(height, width)
+                return torch.from_numpy(depth).unsqueeze(0)
+
+            finally:
+                os.unlink(temp_path)
+
+        except ImportError:
+            logger.warning("OpenEXR not available for EXR parsing")
+            return torch.zeros(1, 64, 64)
+        except Exception as e:
+            logger.error(f"Failed to parse EXR: {e}")
+            return torch.zeros(1, 64, 64)

@@ -169,6 +169,14 @@ class OutputInfo:
     # Inline content for small text
     inline_content: Optional[str] = None
 
+    # 3D type metadata
+    point_count: Optional[int] = None
+    has_sh_coefficients: Optional[bool] = None
+    depth_min: Optional[float] = None
+    depth_max: Optional[float] = None
+    camera_count: Optional[int] = None
+    has_intrinsics: Optional[bool] = None
+
     def to_dict(self) -> dict:
         """Convert to dictionary for metadata payload."""
         result = {
@@ -181,7 +189,9 @@ class OutputInfo:
         for key in ["file_size_bytes", "node_id", "node_type", "output_key",
                     "width", "height", "channels", "dtype", "format",
                     "duration_seconds", "sample_rate", "frame_count", "fps",
-                    "batch_index", "batch_size", "inline_content"]:
+                    "batch_index", "batch_size", "inline_content",
+                    "point_count", "has_sh_coefficients", "depth_min", "depth_max",
+                    "camera_count", "has_intrinsics"]:
             val = getattr(self, key)
             if val is not None:
                 result[key] = val
