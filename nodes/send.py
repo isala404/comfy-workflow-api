@@ -364,6 +364,62 @@ class WebhookSend:
                 )
                 return (filename, data, "audio/flac", output_info)
 
+        # VIDEO - ComfyUI VideoFromComponents (new API with get_components method)
+        if hasattr(value, "get_components") and callable(value.get_components):
+            try:
+                components = value.get_components()
+                images = getattr(components, "images", None)
+                frame_rate = getattr(components, "frame_rate", None)
+                audio = getattr(components, "audio", None)
+
+                if images is not None:
+                    fps = float(frame_rate) if frame_rate is not None else 24.0
+                    video_dict = {"images": images, "fps": fps}
+                    if audio is not None:
+                        video_dict["audio"] = audio
+
+                    data = self._video_to_mp4(video_dict)
+                    if data:
+                        filename = f"{name}.mp4"
+                        output_info = OutputInfo(
+                            type="VIDEO",
+                            filename=filename,
+                            mime_type="video/mp4",
+                            file_size_bytes=len(data),
+                            width=images.shape[2] if torch.is_tensor(images) else None,
+                            height=images.shape[1] if torch.is_tensor(images) else None,
+                            format="mp4",
+                        )
+                        return (filename, data, "video/mp4", output_info)
+                    else:
+                        logger.warning(f"WebhookSend: Failed to encode video for field '{name}'")
+            except Exception as e:
+                logger.error(f"WebhookSend: Error processing VideoFromComponents: {e}")
+
+        # VIDEO - Legacy video objects with direct images/fps attributes
+        if hasattr(value, "images") and hasattr(value, "fps"):
+            video_dict = {
+                "images": value.images,
+                "fps": value.fps if isinstance(value.fps, (int, float)) else 24,
+            }
+            if hasattr(value, "audio") and value.audio is not None:
+                video_dict["audio"] = value.audio
+            data = self._video_to_mp4(video_dict)
+            if data:
+                filename = f"{name}.mp4"
+                fps = video_dict["fps"]
+                images = video_dict["images"]
+                output_info = OutputInfo(
+                    type="VIDEO",
+                    filename=filename,
+                    mime_type="video/mp4",
+                    file_size_bytes=len(data),
+                    width=images.shape[2] if torch.is_tensor(images) else None,
+                    height=images.shape[1] if torch.is_tensor(images) else None,
+                    format="mp4",
+                )
+                return (filename, data, "video/mp4", output_info)
+
         # VIDEO dict or tensor
         if isinstance(value, dict) and "images" in value:
             data = self._video_to_mp4(value)
@@ -549,9 +605,11 @@ class WebhookSend:
             return None
 
         try:
+            from fractions import Fraction
             buffer = io.BytesIO()
             container = av.open(buffer, mode="w", format="mp4")
-            stream = container.add_stream("libx264", rate=fps)
+            fps_fraction = Fraction(fps).limit_denominator(1000)
+            stream = container.add_stream("h264", rate=fps_fraction)
 
             if len(images.shape) == 4:
                 height, width = images.shape[1], images.shape[2]
